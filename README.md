@@ -104,7 +104,7 @@ experience, we strongly recommend using the [MCP Inspector](https://github.com/m
 You can launch the MCP Inspector via [`npm`](https://docs.npmjs.com/downloading-and-installing-node-js-and-npm) with this command:
 
 ```bash
-npx @modelcontextprotocol/inspector uv --directory /Users/koladev/speakeasy-projects/mcp-discord-chat run mcp-discord-chat
+npx @modelcontextprotocol/inspector uv --directory /Users/speakeasy-projects/mcp-discord-chat run mcp-discord-chat
 ```
 
 
