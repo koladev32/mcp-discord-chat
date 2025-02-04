@@ -1,164 +1,266 @@
+import os
 import asyncio
+import logging
+from datetime import datetime
+from typing import Any, List
+from functools import wraps
 
-from mcp.server.models import InitializationOptions
-import mcp.types as types
-from mcp.server import NotificationOptions, Server
-from pydantic import AnyUrl
-import mcp.server.stdio
+import discord
+from discord.ext import commands
+from mcp.server import Server
+from mcp.types import Tool, TextContent
+from mcp.server.stdio import stdio_server
 
-# Store notes as a simple key-value dict to demonstrate state management
-notes: dict[str, str] = {}
+# -----------------------------------------------------------------------------
+# Logging Configuration
+# -----------------------------------------------------------------------------
+# Set up logging to output informational messages. This helps with debugging
+# and monitoring the application during runtime.
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("discord-mcp-server")
 
-server = Server("mcp-discord-chat")
+# -----------------------------------------------------------------------------
+# Discord Bot Setup
+# -----------------------------------------------------------------------------
+# Retrieve the Discord token from the environment. This token authenticates the
+# bot with Discord's API. The application will exit if the token is not provided.
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+if not DISCORD_TOKEN:
+    raise ValueError("DISCORD_TOKEN environment variable is required")
 
-@server.list_resources()
-async def handle_list_resources() -> list[types.Resource]:
+# Create a Discord bot instance with necessary intents.
+# Here, we enable the 'message_content' intent to allow the bot to read message content.
+# The 'members' intent is also enabled to access member information.
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# -----------------------------------------------------------------------------
+# MCP Server Initialization
+# -----------------------------------------------------------------------------
+# Create an MCP server instance. The MCP (Model Context Protocol) server will
+# allow external calls to registered tools (commands) in this application.
+app = Server("discord-server")
+
+# Global variable to store the Discord client instance once the bot is ready.
+discord_client = None
+
+# -----------------------------------------------------------------------------
+# Helper Functions
+# -----------------------------------------------------------------------------
+def format_reactions(reactions: List[dict]) -> str:
     """
-    List available note resources.
-    Each note is exposed as a resource with a custom note:// URI scheme.
+    Format a list of reaction dictionaries into a human-readable string.
+    Each reaction is shown as: emoji(count).
+    If no reactions are present, returns "No reactions".
     """
-    return [
-        types.Resource(
-            uri=AnyUrl(f"note://internal/{name}"),
-            name=f"Note: {name}",
-            description=f"A simple note named {name}",
-            mimeType="text/plain",
-        )
-        for name in notes
-    ]
+    if not reactions:
+        return "No reactions"
+    return ", ".join(f"{r['emoji']}({r['count']})" for r in reactions)
 
-@server.read_resource()
-async def handle_read_resource(uri: AnyUrl) -> str:
+def require_discord_client(func):
     """
-    Read a specific note's content by its URI.
-    The note name is extracted from the URI host component.
+    Decorator to ensure the Discord client is ready before executing a tool.
+    Raises a RuntimeError if the client is not yet available.
     """
-    if uri.scheme != "note":
-        raise ValueError(f"Unsupported URI scheme: {uri.scheme}")
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        if not discord_client:
+            raise RuntimeError("Discord client not ready")
+        return await func(*args, **kwargs)
+    return wrapper
 
-    name = uri.path
-    if name is not None:
-        name = name.lstrip("/")
-        return notes[name]
-    raise ValueError(f"Note not found: {name}")
-
-@server.list_prompts()
-async def handle_list_prompts() -> list[types.Prompt]:
+# -----------------------------------------------------------------------------
+# Discord Bot Events
+# -----------------------------------------------------------------------------
+@bot.event
+async def on_ready():
     """
-    List available prompts.
-    Each prompt can have optional arguments to customize its behavior.
+    Event handler called when the Discord bot successfully logs in.
+    Sets the global discord_client variable and logs the bot's username.
     """
-    return [
-        types.Prompt(
-            name="summarize-notes",
-            description="Creates a summary of all notes",
-            arguments=[
-                types.PromptArgument(
-                    name="style",
-                    description="Style of the summary (brief/detailed)",
-                    required=False,
-                )
-            ],
-        )
-    ]
+    global discord_client
+    discord_client = bot
+    logger.info(f"Logged in as {bot.user.name}")
 
-@server.get_prompt()
-async def handle_get_prompt(
-    name: str, arguments: dict[str, str] | None
-) -> types.GetPromptResult:
+# -----------------------------------------------------------------------------
+# MCP Tools Registration
+# -----------------------------------------------------------------------------
+@app.list_tools()
+async def list_tools() -> List[Tool]:
     """
-    Generate a prompt by combining arguments with server state.
-    The prompt includes all current notes and can be customized via arguments.
-    """
-    if name != "summarize-notes":
-        raise ValueError(f"Unknown prompt: {name}")
-
-    style = (arguments or {}).get("style", "brief")
-    detail_prompt = " Give extensive details." if style == "detailed" else ""
-
-    return types.GetPromptResult(
-        description="Summarize the current notes",
-        messages=[
-            types.PromptMessage(
-                role="user",
-                content=types.TextContent(
-                    type="text",
-                    text=f"Here are the current notes to summarize:{detail_prompt}\n\n"
-                    + "\n".join(
-                        f"- {name}: {content}"
-                        for name, content in notes.items()
-                    ),
-                ),
-            )
-        ],
-    )
-
-@server.list_tools()
-async def handle_list_tools() -> list[types.Tool]:
-    """
-    List available tools.
-    Each tool specifies its arguments using JSON Schema validation.
+    Register and list the available MCP tools for the Discord server.
+    Only three tools are registered:
+      - add_reaction: Adds an emoji reaction to a message.
+      - send_message: Sends a message to a specified Discord channel.
+      - read_messages: Retrieves recent messages from a Discord channel.
     """
     return [
-        types.Tool(
-            name="add-note",
-            description="Add a new note",
+        Tool(
+            name="add_reaction",
+            description="Add a reaction to a message",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string"},
-                    "content": {"type": "string"},
+                    "channel_id": {
+                        "type": "string",
+                        "description": "ID of the channel containing the message",
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "ID of the message to react to",
+                    },
+                    "emoji": {
+                        "type": "string",
+                        "description": "Emoji to react with (Unicode or custom emoji ID)",
+                    },
                 },
-                "required": ["name", "content"],
+                "required": ["channel_id", "message_id", "emoji"],
             },
-        )
+        ),
+        Tool(
+            name="send_message",
+            description="Send a message to a specific channel",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Discord channel ID where the message will be sent",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Content of the message to send",
+                    },
+                },
+                "required": ["channel_id", "content"],
+            },
+        ),
+        Tool(
+            name="read_messages",
+            description="Read recent messages from a channel",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Discord channel ID from which to fetch messages",
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Number of messages to fetch (max 100)",
+                        "minimum": 1,
+                        "maximum": 100,
+                    },
+                },
+                "required": ["channel_id"],
+            },
+        ),
     ]
 
-@server.call_tool()
-async def handle_call_tool(
-    name: str, arguments: dict | None
-) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+@app.call_tool()
+@require_discord_client
+async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     """
-    Handle tool execution requests.
-    Tools can modify server state and notify clients of changes.
+    Dispatch function for tool calls. This function checks the 'name' of the tool
+    requested and performs the corresponding Discord operation.
+    
+    Tools implemented:
+      - send_message: Sends a message to a channel.
+      - read_messages: Retrieves recent messages from a channel.
+      - add_reaction: Adds a reaction (emoji) to a message.
+    
+    Returns:
+      A list of TextContent objects containing the result of the operation.
     """
-    if name != "add-note":
-        raise ValueError(f"Unknown tool: {name}")
+    if name == "send_message":
+        # Retrieve the channel and send the message with the provided content.
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        message = await channel.send(arguments["content"])
+        return [
+            TextContent(
+                type="text",
+                text=f"Message sent successfully. Message ID: {message.id}"
+            )
+        ]
 
-    if not arguments:
-        raise ValueError("Missing arguments")
-
-    note_name = arguments.get("name")
-    content = arguments.get("content")
-
-    if not note_name or not content:
-        raise ValueError("Missing name or content")
-
-    # Update server state
-    notes[note_name] = content
-
-    # Notify clients that resources have changed
-    await server.request_context.session.send_resource_list_changed()
-
-    return [
-        types.TextContent(
-            type="text",
-            text=f"Added note '{note_name}' with content: {content}",
+    elif name == "read_messages":
+        # Retrieve the channel and fetch a limited number of recent messages.
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        limit = min(int(arguments.get("limit", 10)), 100)
+        messages = []
+        async for message in channel.history(limit=limit):
+            reaction_data = []
+            # Iterate through reactions and collect emoji data.
+            for reaction in message.reactions:
+                emoji_str = (
+                    str(reaction.emoji.name)
+                    if hasattr(reaction.emoji, "name") and reaction.emoji.name
+                    else (
+                        str(reaction.emoji.id)
+                        if hasattr(reaction.emoji, "id")
+                        else str(reaction.emoji)
+                    )
+                )
+                reaction_info = {"emoji": emoji_str, "count": reaction.count}
+                logger.debug(f"Found reaction: {emoji_str}")
+                reaction_data.append(reaction_info)
+            messages.append(
+                {
+                    "id": str(message.id),
+                    "author": str(message.author),
+                    "content": message.content,
+                    "timestamp": message.created_at.isoformat(),
+                    "reactions": reaction_data,
+                }
+            )
+        # Format the messages for output.
+        formatted_messages = "\n".join(
+            f"{m['author']} ({m['timestamp']}): {m['content']}\nReactions: {format_reactions(m['reactions'])}"
+            for m in messages
         )
-    ]
+        return [
+            TextContent(
+                type="text",
+                text=f"Retrieved {len(messages)} messages:\n\n{formatted_messages}"
+            )
+        ]
 
+    elif name == "add_reaction":
+        # Retrieve the channel and message, then add the specified reaction.
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        message = await channel.fetch_message(int(arguments["message_id"]))
+        await message.add_reaction(arguments["emoji"])
+        return [
+            TextContent(
+                type="text",
+                text=f"Added reaction '{arguments['emoji']}' to message {message.id}"
+            )
+        ]
+
+    # If the tool name is not recognized, raise an error.
+    raise ValueError(f"Unknown tool: {name}")
+
+# -----------------------------------------------------------------------------
+# Main Function: Starts Discord Bot and MCP Server
+# -----------------------------------------------------------------------------
 async def main():
-    # Run the server using stdin/stdout streams
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="mcp-discord-chat",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
-        )
+    """
+    Main entry point of the application.
+    
+    - Starts the Discord bot as a background task.
+    - Runs the MCP server using standard I/O for communication.
+    """
+    # Start the Discord bot in the background so that it can handle events.
+    asyncio.create_task(bot.start(DISCORD_TOKEN))
+
+    # Open a connection using the stdio server transport and run the MCP server.
+    async with stdio_server() as (read_stream, write_stream):
+        await app.run(read_stream, write_stream, app.create_initialization_options())
+
+# -----------------------------------------------------------------------------
+# Application Entry Point
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    asyncio.run(main())
