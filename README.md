@@ -1,5 +1,7 @@
 # mcp-discord-chat MCP server
 
+[![smithery badge](https://smithery.ai/badge/@koladev32/mcp-discord-chat)](https://smithery.ai/server/@koladev32/mcp-discord-chat)
+
 A MCP server project
 
 ## Components
@@ -31,6 +33,14 @@ The server implements one tool:
 ## Quickstart
 
 ### Install
+
+### Installing via Smithery
+
+To install mcp-discord-chat MCP server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@koladev32/mcp-discord-chat):
+
+```bash
+npx -y @smithery/cli install @koladev32/mcp-discord-chat --client claude
+```
 
 #### Claude Desktop
 
